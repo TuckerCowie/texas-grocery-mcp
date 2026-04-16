@@ -62,6 +62,10 @@ PERSISTED_QUERIES = {
     "alertEntryPoint": "3e3ccd248652e8fce4674d0c5f3f30f2ddc63da277bfa0ff36ea9420e5dffd5e",
     "cartEstimated": "7b033abaf2caa80bc49541e51d2b89e3cc6a316e37c4bd576d9b5c498a51e9c5",
     "typeaheadContent": "1ed956c0f10efcfc375321f33c40964bc236fff1397a4e86b7b53cb3b18ad329",
+    "getShoppingListsV2": "35da893a3476a098d44f8d6ac379db3129117b977d4df4dcbe48a5641eb9fdd5",
+    "getShoppingListV2": "4c8d819ca6029005863673c5d7962154955293fdde782786ce42f99ec3193b86",
+    "addToShoppingListV2": "a42ced362e226fc6913b7615da0a460a32c24af9cc7502c1f0fe52193855aa1b",
+    "deleteShoppingListItems": "b135b7899b1b6d1d7e176575b2dcb989d48fedda3050fe418618ec4a9690f6e3",
     "cartItemV2": "ade8ec1365c185244d42f9cc4c13997fec4b633ac3c38ff39558df92b210c6d0",
     "StoreSearch": "e01fa39e66c3a2c7881322bc48af6a5af97d49b1442d433f2d09d273de2db4b6",
     "CouponClip": "88b18ac22cee98372428d9a91d759ffb5e919026ee61c747f9f88d11336b846b",
@@ -1791,6 +1795,102 @@ class HEBGraphQLClient:
             {"userIsLoggedIn": True},
         )
 
+    async def get_shopping_lists(self) -> dict[str, Any]:
+        """Get all shopping lists for the authenticated user."""
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+        return await self._execute_persisted_query_with_client(
+            auth_client, "getShoppingListsV2", {}
+        )
+
+    async def get_shopping_list_items(
+        self,
+        list_id: str,
+    ) -> dict[str, Any]:
+        """Get the items of a specific shopping list, including their item UUIDs.
+
+        The item UUIDs are required by deleteShoppingListItems.
+
+        Args:
+            list_id: The list ID whose items to fetch
+
+        Returns:
+            List data (with items) or error dict if not authenticated
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+
+        return await self._execute_persisted_query_with_client(
+            auth_client,
+            "getShoppingListV2",
+            {
+                "input": {
+                    "id": list_id,
+                    "page": {"page": 0, "size": 500, "sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+        )
+
+    async def add_to_shopping_list(
+        self,
+        list_id: str,
+        product_id: str,
+        quantity: int = 1,
+    ) -> dict[str, Any]:
+        """Add an item to a shopping list.
+
+        Requires authentication cookies to be available.
+
+        Args:
+            list_id: The list ID
+            product_id: The product ID
+            quantity: Number of units to add (default 1)
+
+        Returns:
+            List response data or error dict if not authenticated
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+
+        return await self._execute_persisted_query_with_client(
+            auth_client,
+            "addToShoppingListV2",
+            {
+                "input": {
+                    "listId": list_id,
+                    "listItems": [
+                        {
+                            "item": {"productId": product_id},
+                            "quantityOrWeight": {"quantity": quantity},
+                        }
+                    ],
+                    "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+        )
+
+    async def delete_shopping_list_items(
+        self, list_id: str, item_ids: list[str]
+    ) -> dict[str, Any]:
+        """Delete items from a shopping list by their list-item UUIDs."""
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+        return await self._execute_persisted_query_with_client(
+            auth_client,
+            "deleteShoppingListItems",
+            {
+                "input": {
+                    "itemIds": item_ids,
+                    "listId": list_id,
+                    "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+        )
+
     @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
     async def _execute_persisted_query_with_client(
         self,
@@ -1833,6 +1933,10 @@ class HEBGraphQLClient:
             response.raise_for_status()
 
             data: Any = response.json()
+
+            # The API sometimes returns a batch array; unwrap the first element.
+            if isinstance(data, list):
+                data = data[0].data if data else {}
 
             if "errors" in data:
                 for error in data["errors"]:

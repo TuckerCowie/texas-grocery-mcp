@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - _Unreleased_
+
+### Added
+- **Shopping List Tools** — manage your HEB shopping list through natural conversation
+  - `shopping_list_check_auth` - Check authentication status
+  - `shopping_list_get` - View shopping list with items, quantities, and prices
+  - `shopping_list_add` - Add item with human-in-the-loop confirmation and post-add verification
+  - `shopping_list_add_many` - Bulk add up to 20 items with a single confirmation
+  - `shopping_list_add_with_retry` - Add item with automatic product ID correction on failure
+  - `shopping_list_remove` - Remove item by product ID with preview before deletion
+- `HEB_DEFAULT_SHOPPING_LIST` environment variable — set a default shopping list by name (e.g. `"This Week"`); all shopping list tools use it automatically
+- `HEB_DEFAULT_STORE` environment variable is now applied at server startup, so the default store no longer requires a `store_change` call after restart
+
 ## [0.1.2] - 2026-02-02
 
 ### Changed
