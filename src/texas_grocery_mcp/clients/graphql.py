@@ -58,15 +58,17 @@ class PersistedQueryNotFoundError(Exception):
 # Persisted Query Hashes (discovered via reverse engineering)
 # These may change when HEB deploys new code
 PERSISTED_QUERIES = {
-    "ShopNavigation": "0e669423cef683226cb8eb295664619c8e0f95945734e0a458095f51ee89efb3",
+    "ShopNavigation": "53197129989f3555e560f3d11a85ebff9a2abe9d9cf6f7f10a8c93feda9503b2",
     "alertEntryPoint": "3e3ccd248652e8fce4674d0c5f3f30f2ddc63da277bfa0ff36ea9420e5dffd5e",
-    "cartEstimated": "7b033abaf2caa80bc49541e51d2b89e3cc6a316e37c4bd576d9b5c498a51e9c5",
+    "cartEstimated": "1c4f4e6cbbf1702055ed5a70f9e7b746b3f62777e04ebbb294abfc6fb15c6b70",
     "typeaheadContent": "1ed956c0f10efcfc375321f33c40964bc236fff1397a4e86b7b53cb3b18ad329",
     "cartItemV2": "ade8ec1365c185244d42f9cc4c13997fec4b633ac3c38ff39558df92b210c6d0",
     "StoreSearch": "e01fa39e66c3a2c7881322bc48af6a5af97d49b1442d433f2d09d273de2db4b6",
     "CouponClip": "88b18ac22cee98372428d9a91d759ffb5e919026ee61c747f9f88d11336b846b",
     # Store change mutation - changes the active pickup store
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
+    "listPickupTimeslotsV2": "11e41cf668387eb09950234e6802eb6fe9c1bddb391ff3d83ae4ce47c1ceda08",
+    "ReserveTimeslot": "263b3cf61d086e3af9056f755fca18cb33f77808e876c7798ef032890b3afe19",
 }
 
 # Well-known HEB stores (fallback for store search)
@@ -152,6 +154,39 @@ class HEBGraphQLClient:
             ttl_hours=24,
             max_size=500,  # Cache up to 500 products
         )
+
+    @staticmethod
+    def _build_persisted_query_payload(
+        operation_name: str,
+        variables: dict[str, Any],
+        *,
+        batched: bool = False,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "operationName": operation_name,
+            "variables": variables,
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": PERSISTED_QUERIES[operation_name],
+                }
+            },
+        }
+        return [payload] if batched else payload
+
+    @staticmethod
+    def _extract_graphql_payload(data: Any) -> dict[str, Any]:
+        """Normalize GraphQL responses that may be wrapped in a single-item list."""
+        if isinstance(data, list):
+            if not data:
+                return {}
+            first_item = data[0]
+            if isinstance(first_item, dict):
+                return first_item
+            return {}
+        if isinstance(data, dict):
+            return data
+        return {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create basic HTTP client (no auth cookies)."""
@@ -257,12 +292,15 @@ class HEBGraphQLClient:
         self,
         operation_name: str,
         variables: dict[str, Any],
+        *,
+        batched: bool = False,
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query.
 
         Args:
             operation_name: The name of the persisted operation
             variables: Query variables
+            batched: Send/parse the request as a single-item GraphQL batch
 
         Returns:
             Response data
@@ -279,40 +317,34 @@ class HEBGraphQLClient:
                 raise ValueError(f"Unknown operation: {operation_name}")
 
             client = await self._get_client()
-
-            payload = {
-                "operationName": operation_name,
-                "variables": variables,
-                "extensions": {
-                    "persistedQuery": {
-                        "version": 1,
-                        "sha256Hash": PERSISTED_QUERIES[operation_name],
-                    }
-                },
-            }
+            payload = self._build_persisted_query_payload(
+                operation_name,
+                variables,
+                batched=batched,
+            )
 
             try:
                 response = await client.post(self.base_url, json=payload)
                 response.raise_for_status()
 
                 data: Any = response.json()
+                graphql_payload = self._extract_graphql_payload(data)
 
                 # Check for persisted query errors
-                if "errors" in data:
-                    for error in data["errors"]:
+                if "errors" in graphql_payload:
+                    for error in graphql_payload["errors"]:
                         if "PersistedQueryNotFound" in str(error):
                             raise PersistedQueryNotFoundError(
                                 f"Persisted query hash for '{operation_name}' is no longer valid"
                             )
 
-                    raise GraphQLError(data["errors"])
+                    raise GraphQLError(graphql_payload["errors"])
 
                 self.circuit_breaker.record_success()
 
-                if isinstance(data, dict):
-                    payload_data = data.get("data")
-                    if isinstance(payload_data, dict):
-                        return cast(dict[str, Any], payload_data)
+                payload_data = graphql_payload.get("data")
+                if isinstance(payload_data, dict):
+                    return cast(dict[str, Any], payload_data)
                 return {}
 
             except (httpx.HTTPError, GraphQLError) as e:
@@ -1791,12 +1823,155 @@ class HEBGraphQLClient:
             {"userIsLoggedIn": True},
         )
 
+    async def list_pickup_timeslots(self, store_id: str | int) -> dict[str, Any]:
+        """List available pickup timeslots for a store."""
+        store_number = int(store_id)
+        data = await self._execute_persisted_query(
+            "listPickupTimeslotsV2",
+            {"storeNumber": store_number, "limit": 2147483647},
+            batched=True,
+        )
+        availability = data.get("listPickupTimeslotsV2", {})
+        slots_by_day = availability.get("slotsByDay", [])
+        display_messages = availability.get("displayMessages", [])
+
+        days: list[dict[str, Any]] = []
+        for day in slots_by_day:
+            groups: list[dict[str, Any]] = []
+            for group in day.get("slotsByGroup", []):
+                slots = [
+                    {
+                        "id": slot.get("id"),
+                        "record_id": slot.get("recordId"),
+                        "start": slot.get("start"),
+                        "end": slot.get("end"),
+                        "is_free": slot.get("isFree"),
+                        "days_in_advance": slot.get("daysInAdvance"),
+                        "fulfillment_type": slot.get("fulfillmentType"),
+                        "price": slot.get("totalPrice"),
+                        "fees": slot.get("fees", []),
+                    }
+                    for slot in group.get("slots", [])
+                ]
+                groups.append(
+                    {
+                        "group": group.get("group"),
+                        "title": group.get("title"),
+                        "tier": group.get("tier"),
+                        "empty_state_text": group.get("emptyStateText"),
+                        "price": group.get("price"),
+                        "slots": slots,
+                    }
+                )
+
+            days.append(
+                {
+                    "date": day.get("date"),
+                    "has_free": day.get("hasFree"),
+                    "is_full": day.get("isFull"),
+                    "min_price": day.get("minPrice"),
+                    "max_price": day.get("maxPrice"),
+                    "slot_count": sum(len(group["slots"]) for group in groups),
+                    "groups": groups,
+                }
+            )
+
+        return {
+            "store_id": str(store_id),
+            "available_days": len(days),
+            "days": days,
+            "display_messages": display_messages,
+        }
+
+    async def reserve_timeslot(
+        self,
+        slot_id: str,
+        date: str,
+        store_id: str | int,
+        ignore_conflicts: bool = False,
+    ) -> dict[str, Any]:
+        """Reserve a pickup timeslot and verify it via cart refresh."""
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Login required to reserve a pickup timeslot",
+            }
+
+        result = await self._execute_persisted_query_with_client(
+            auth_client,
+            "ReserveTimeslot",
+            {
+                "id": slot_id,
+                "date": date,
+                "fulfillmentType": "PICKUP",
+                "pickupStoreId": str(store_id),
+                "ignoreCartConflicts": ignore_conflicts,
+                "storeId": int(store_id),
+                "userIsLoggedIn": True,
+            },
+            batched=True,
+        )
+        reservation = result.get("reserveTimeslotV3", {})
+
+        cart = await self.get_cart()
+        if cart.get("error"):
+            return {
+                "error": True,
+                "code": "VERIFICATION_FAILED",
+                "message": "Timeslot reservation could not be verified - cart fetch failed",
+                "requested_slot_id": slot_id,
+                "reservation_response": reservation,
+            }
+
+        cart_v2 = cart.get("cartV2") or cart.get("cart") or {}
+        cart_slot = cart_v2.get("timeslot") or {}
+        actual_slot_id = str(cart_slot.get("id", ""))
+        actual_store_id = str(((cart_v2.get("fulfillment") or {}).get("store") or {}).get("id", ""))
+
+        if actual_slot_id == slot_id and actual_store_id == str(store_id):
+            return {
+                "success": True,
+                "verified": True,
+                "store_id": actual_store_id or str(store_id),
+                "timeslot": {
+                    "id": cart_slot.get("id"),
+                    "record_id": cart_slot.get("recordId"),
+                    "date": cart_slot.get("date"),
+                    "start_time": cart_slot.get("startTime"),
+                    "end_time": cart_slot.get("endTime"),
+                    "expiry": cart_slot.get("expiry"),
+                    "start_datetime": cart_slot.get("startDateTime"),
+                    "end_datetime": cart_slot.get("endDateTime"),
+                    "expiry_datetime": cart_slot.get("expiryDateTime"),
+                },
+                "reservation": reservation,
+            }
+
+        return {
+            "error": True,
+            "code": "TIMESLOT_NOT_RESERVED",
+            "message": (
+                "Timeslot reservation did not stick after verification. "
+                f"Cart shows slot '{actual_slot_id or 'none'}' "
+                f"for store '{actual_store_id or 'none'}'."
+            ),
+            "requested_slot_id": slot_id,
+            "actual_slot_id": actual_slot_id,
+            "requested_store_id": str(store_id),
+            "actual_store_id": actual_store_id,
+            "reservation_response": reservation,
+        }
+
     @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
     async def _execute_persisted_query_with_client(
         self,
         client: httpx.AsyncClient,
         operation_name: str,
         variables: dict[str, Any],
+        *,
+        batched: bool = False,
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query with a specific client.
 
@@ -1804,6 +1979,7 @@ class HEBGraphQLClient:
             client: httpx client to use (may have cookies)
             operation_name: The name of the persisted operation
             variables: Query variables
+            batched: Send/parse the request as a single-item GraphQL batch
 
         Returns:
             Response data
@@ -1813,16 +1989,11 @@ class HEBGraphQLClient:
         if operation_name not in PERSISTED_QUERIES:
             raise ValueError(f"Unknown operation: {operation_name}")
 
-        payload = {
-            "operationName": operation_name,
-            "variables": variables,
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": PERSISTED_QUERIES[operation_name],
-                }
-            },
-        }
+        payload = self._build_persisted_query_payload(
+            operation_name,
+            variables,
+            batched=batched,
+        )
 
         try:
             response = await client.post(
@@ -1833,21 +2004,21 @@ class HEBGraphQLClient:
             response.raise_for_status()
 
             data: Any = response.json()
+            graphql_payload = self._extract_graphql_payload(data)
 
-            if "errors" in data:
-                for error in data["errors"]:
+            if "errors" in graphql_payload:
+                for error in graphql_payload["errors"]:
                     if "PersistedQueryNotFound" in str(error):
                         raise PersistedQueryNotFoundError(
                             f"Persisted query hash for '{operation_name}' is no longer valid"
                         )
-                raise GraphQLError(data["errors"])
+                raise GraphQLError(graphql_payload["errors"])
 
             self.circuit_breaker.record_success()
 
-            if isinstance(data, dict):
-                payload_data = data.get("data")
-                if isinstance(payload_data, dict):
-                    return cast(dict[str, Any], payload_data)
+            payload_data = graphql_payload.get("data")
+            if isinstance(payload_data, dict):
+                return cast(dict[str, Any], payload_data)
             return {}
 
         except (httpx.HTTPError, GraphQLError) as e:
