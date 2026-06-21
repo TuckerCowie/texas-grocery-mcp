@@ -964,6 +964,7 @@ async def auto_login_with_credentials(
             # Fill email
             email_filled = False
             email_selectors = [
+                'input#email-input',
                 'input[name="email"]',
                 'input[type="email"]',
                 "#email",
@@ -973,6 +974,7 @@ async def auto_login_with_credentials(
                 try:
                     email_field = await page.query_selector(selector)
                     if email_field:
+                        await email_field.click()
                         await email_field.fill(email)
                         email_filled = True
                         logger.debug("Filled email field", selector=selector)
@@ -988,13 +990,40 @@ async def auto_login_with_credentials(
                     "error": "selector_not_found",
                 }
 
-            # Fill password
+            # Select "credentials" (password) auth mode if radio buttons exist
+            # HEB shows radio buttons: emailOtp (one-time code) vs credentials (password)
+            try:
+                await page.evaluate('''() => {
+                    const cred = document.getElementById('credentials');
+                    const otp = document.getElementById('emailOtp');
+                    if (cred) {
+                        cred.checked = true;
+                        cred.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                    if (otp) otp.checked = false;
+                }''')
+            except Exception:
+                pass
+
+            # Fill password using native React-compatible value setter
+            # HEB uses React, which ignores plain .fill() on re-rendered fields
             password_filled = False
-            for selector in ['input[name="password"]', 'input[type="password"]', '#password']:
+            for selector in ['input#password-input', 'input[name="password"]', 'input[type="password"]', '#password']:
                 try:
                     password_field = await page.query_selector(selector)
                     if password_field:
-                        await password_field.fill(password)
+                        await password_field.click()
+                        # Use native value setter for React compatibility
+                        await page.evaluate('''([sel, pw]) => {
+                            const el = document.querySelector(sel);
+                            if (!el) return;
+                            const nativeSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value'
+                            ).set;
+                            nativeSetter.call(el, pw);
+                            el.dispatchEvent(new Event('input', {bubbles: true}));
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                        }''', [selector, password])
                         password_filled = True
                         logger.debug("Filled password field", selector=selector)
                         break
@@ -1017,6 +1046,7 @@ async def auto_login_with_credentials(
                 'button:has-text("Continue")',
                 'button[type="submit"]:has-text("Continue")',
                 'input[type="submit"][value*="Continue" i]',
+                'button[type="submit"]',
             ]
             for selector in continue_selectors:
                 try:
@@ -1028,7 +1058,7 @@ async def auto_login_with_credentials(
                 except Exception:
                     continue
 
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(5000)
 
             # Check for CAPTCHA after Continue
             if await _detect_captcha(page):
@@ -1055,6 +1085,51 @@ async def auto_login_with_credentials(
 
                 return _build_human_action_response("captcha", screenshot_path)
 
+            # === HEB multi-step: Step 2 "Choose how you log in" ===
+            # After Continue, HEB shows a second page with radio options
+            # (emailOtp vs credentials) and the password field is CLEARED.
+            # We need to re-select credentials and re-fill the password.
+            try:
+                page_text = await page.inner_text('body')
+                if 'Choose how you log in' in page_text or 'Enter password' in page_text:
+                    logger.info("HEB step 2 detected: re-selecting credentials and re-filling password")
+                    await _inject_status_banner(page, "Confirming password login (step 2)...")
+
+                    # Re-select credentials mode
+                    await page.evaluate('''() => {
+                        const cred = document.getElementById('credentials');
+                        if (cred) {
+                            cred.checked = true;
+                            cred.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    }''')
+                    await page.wait_for_timeout(500)
+
+                    # Re-fill password using native setter (field was reset between steps)
+                    for selector in ['input#password-input', 'input[type="password"]', 'input[name="password"]']:
+                        try:
+                            pw_field = await page.query_selector(selector)
+                            if pw_field and await pw_field.is_visible():
+                                await pw_field.click()
+                                await page.evaluate('''([sel, pw]) => {
+                                    const el = document.querySelector(sel);
+                                    if (!el) return;
+                                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                                        window.HTMLInputElement.prototype, 'value'
+                                    ).set;
+                                    nativeSetter.call(el, pw);
+                                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                                }''', [selector, password])
+                                logger.debug("Re-filled password on step 2")
+                                break
+                        except Exception:
+                            continue
+
+                    await page.wait_for_timeout(500)
+            except Exception as e:
+                logger.debug("Step 2 check failed", error=str(e))
+
             # Click Submit button
             await _inject_status_banner(page, "Clicking Submit...")
             await page.wait_for_timeout(500)
@@ -1075,7 +1150,7 @@ async def auto_login_with_credentials(
                 except Exception:
                     continue
 
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(5000)
 
             # Check for CAPTCHA after Submit
             if await _detect_captcha(page):
