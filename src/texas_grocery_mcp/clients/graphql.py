@@ -12,6 +12,7 @@ import httpx
 import structlog
 
 from texas_grocery_mcp.auth.session import get_httpx_cookies, is_authenticated
+from texas_grocery_mcp.clients.persisted_queries import PersistedQueryManager
 from texas_grocery_mcp.models import (
     Coupon,
     CouponCategory,
@@ -126,6 +127,9 @@ class HEBGraphQLClient:
         self._client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
         self._build_id: str | None = None
+
+        # Persisted query hash manager with auto-discovery
+        self._pq_manager = PersistedQueryManager(seed_hashes=PERSISTED_QUERIES)
 
         # Initialize throttlers for rate limiting
         self._ssr_throttler = Throttler(
@@ -260,6 +264,10 @@ class HEBGraphQLClient:
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query.
 
+        Uses the PersistedQueryManager for hash lookup. If the server
+        returns PersistedQueryNotFound, automatically discovers fresh
+        hashes from HEB's JS bundles and retries once.
+
         Args:
             operation_name: The name of the persisted operation
             variables: Query variables
@@ -269,7 +277,7 @@ class HEBGraphQLClient:
 
         Raises:
             GraphQLError: If GraphQL returns errors
-            PersistedQueryNotFoundError: If the hash is not recognized
+            PersistedQueryNotFoundError: If the hash is not recognized after retry
             CircuitBreakerOpenError: If circuit is open
         """
         async with self._graphql_throttler:
@@ -280,13 +288,17 @@ class HEBGraphQLClient:
 
             client = await self._get_client()
 
+            hash_value = self._pq_manager.get_hash(operation_name)
+            if not hash_value:
+                raise ValueError(f"No hash available for operation: {operation_name}")
+
             payload = {
                 "operationName": operation_name,
                 "variables": variables,
                 "extensions": {
                     "persistedQuery": {
                         "version": 1,
-                        "sha256Hash": PERSISTED_QUERIES[operation_name],
+                        "sha256Hash": hash_value,
                     }
                 },
             }
@@ -301,8 +313,15 @@ class HEBGraphQLClient:
                 if "errors" in data:
                     for error in data["errors"]:
                         if "PersistedQueryNotFound" in str(error):
+                            # Try auto-discovery and retry
+                            retry_result = await self._handle_stale_hash(
+                                client, operation_name, variables
+                            )
+                            if retry_result is not None:
+                                return retry_result
                             raise PersistedQueryNotFoundError(
-                                f"Persisted query hash for '{operation_name}' is no longer valid"
+                                f"Persisted query hash for '{operation_name}' is no longer valid "
+                                f"and auto-discovery failed"
                             )
 
                     raise GraphQLError(data["errors"])
@@ -1800,6 +1819,10 @@ class HEBGraphQLClient:
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query with a specific client.
 
+        Uses the PersistedQueryManager for hash lookup. If the server
+        returns PersistedQueryNotFound, auto-discovers fresh hashes and
+        retries once.
+
         Args:
             client: httpx client to use (may have cookies)
             operation_name: The name of the persisted operation
@@ -1813,13 +1836,17 @@ class HEBGraphQLClient:
         if operation_name not in PERSISTED_QUERIES:
             raise ValueError(f"Unknown operation: {operation_name}")
 
+        hash_value = self._pq_manager.get_hash(operation_name)
+        if not hash_value:
+            raise ValueError(f"No hash available for operation: {operation_name}")
+
         payload = {
             "operationName": operation_name,
             "variables": variables,
             "extensions": {
                 "persistedQuery": {
                     "version": 1,
-                    "sha256Hash": PERSISTED_QUERIES[operation_name],
+                    "sha256Hash": hash_value,
                 }
             },
         }
@@ -1837,8 +1864,15 @@ class HEBGraphQLClient:
             if "errors" in data:
                 for error in data["errors"]:
                     if "PersistedQueryNotFound" in str(error):
+                        # Try auto-discovery and retry
+                        retry_result = await self._handle_stale_hash(
+                            client, operation_name, variables
+                        )
+                        if retry_result is not None:
+                            return retry_result
                         raise PersistedQueryNotFoundError(
-                            f"Persisted query hash for '{operation_name}' is no longer valid"
+                            f"Persisted query hash for '{operation_name}' is no longer valid "
+                            f"and auto-discovery failed"
                         )
                 raise GraphQLError(data["errors"])
 
@@ -1859,12 +1893,113 @@ class HEBGraphQLClient:
             )
             raise
 
+    async def _handle_stale_hash(
+        self,
+        client: httpx.AsyncClient,
+        operation_name: str,
+        variables: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Handle a stale persisted query hash by auto-discovering fresh ones.
+
+        Called when the server returns PersistedQueryNotFound. Attempts to
+        discover current hashes from HEB's JS bundles, then retries the
+        query with the fresh hash.
+
+        Args:
+            client: The httpx client to use for discovery and retry
+            operation_name: The operation that failed
+            variables: The original query variables
+
+        Returns:
+            Response data if retry succeeds, None if discovery fails
+        """
+        logger.info(
+            "Persisted query hash stale for '%s', attempting auto-discovery...",
+            operation_name,
+        )
+
+        try:
+            # Prefer authenticated client for discovery (bypasses WAF)
+            discover_client = await self._get_authenticated_client()
+            if not discover_client:
+                discover_client = client
+
+            discovered = await self._pq_manager.auto_discover(discover_client)
+            if not discovered:
+                logger.warning(
+                    "Auto-discovery found no hashes for '%s'", operation_name
+                )
+                return None
+
+            new_hash = self._pq_manager.get_hash(operation_name)
+            if not new_hash:
+                logger.warning(
+                    "Auto-discovery didn't find hash for '%s'", operation_name
+                )
+                return None
+
+            logger.info(
+                "Retrying '%s' with fresh hash: %s...",
+                operation_name,
+                new_hash[:16],
+            )
+
+            # Retry with the fresh hash
+            retry_payload = {
+                "operationName": operation_name,
+                "variables": variables,
+                "extensions": {
+                    "persistedQuery": {
+                        "version": 1,
+                        "sha256Hash": new_hash,
+                    }
+                },
+            }
+
+            response = await client.post(
+                self.base_url,
+                json=retry_payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            response.raise_for_status()
+
+            retry_data: Any = response.json()
+
+            if "errors" in retry_data:
+                logger.error(
+                    "Retry still failed for '%s': %s",
+                    operation_name,
+                    retry_data["errors"],
+                )
+                return None
+
+            self.circuit_breaker.record_success()
+
+            if isinstance(retry_data, dict):
+                payload_data = retry_data.get("data")
+                if isinstance(payload_data, dict):
+                    return cast(dict[str, Any], payload_data)
+            return {}
+
+        except Exception as e:
+            logger.error(
+                "Auto-discovery retry failed for '%s': %s",
+                operation_name,
+                str(e),
+            )
+            return None
+
     def get_status(self) -> dict[str, Any]:
         """Get client status for health checks."""
         return {
             "circuit_breaker": self.circuit_breaker.get_status(),
             "build_id": self._build_id,
             "known_stores": len(KNOWN_STORES),
+            "persisted_query_hashes": len(self._pq_manager.all_hashes),
+            "discovered_hashes": len(self._pq_manager._discovered),
         }
 
     # ===================
