@@ -22,6 +22,10 @@ class Settings(BaseSettings):
         default=None,
         description="Default HEB store ID for operations",
     )
+    heb_default_shopping_list: str | None = Field(
+        default=None,
+        description="Default HEB shopping list name for operations",
+    )
     heb_graphql_url: str = Field(
         default="https://www.heb.com/graphql",
         description="HEB GraphQL API endpoint",

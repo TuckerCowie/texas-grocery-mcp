@@ -6,7 +6,7 @@
 
 > 🤖 Let AI do your grocery shopping! An MCP server that connects Claude to H-E-B grocery stores.
 
-**Search products, manage your cart, clip coupons, and more — all through natural conversation.**
+**Search products, manage your cart and shopping list, clip coupons, and more — all through natural conversation.**
 
 ⚠️ This project is **not affiliated with H-E-B**. It uses unofficial web APIs and browser automation against HEB.com; use responsibly and ensure your usage complies with applicable terms and laws.
 
@@ -18,6 +18,7 @@
 |---------|-------------|
 | 🏪 **Store Search** | Find HEB stores by address or zip code |
 | 🔍 **Product Search** | Search products with pricing and availability |
+| 📝 **Shopping List** | Add/remove items from your HEB shopping list |
 | 🛒 **Cart Management** | Add/remove items with human-in-the-loop confirmation |
 | 📋 **Product Details** | Ingredients, nutrition facts, allergens, warnings |
 | 🎟️ **Digital Coupons** | List, search, and clip coupons to save money |
@@ -81,6 +82,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HEB_DEFAULT_STORE` | Default store ID | None |
+| `HEB_DEFAULT_SHOPPING_LIST` | Default shopping list name | None |
 | `REDIS_URL` | Redis cache URL | None (in-memory) |
 | `LOG_LEVEL` | Logging level | INFO |
 
@@ -132,6 +134,21 @@ Agent uses: cart_add(product_id="123456", quantity=2)
 
 Agent uses: cart_add(product_id="123456", quantity=2, confirm=true)
 # ✅ Added to cart!
+```
+
+### 📝 Managing Your Shopping List
+
+```
+User: Add 2 gallons of milk to my shopping list
+
+Agent uses: shopping_list_add(product_id="123456", quantity=2)
+# Returns preview for confirmation
+
+Agent uses: shopping_list_add(product_id="123456", quantity=2, confirm=true)
+# ✅ Added to shopping list (verified)!
+
+Agent uses: shopping_list_get()
+# Returns current list with all items, quantities, and prices
 ```
 
 ### 🎟️ Clipping Coupons
@@ -195,6 +212,15 @@ Agent uses: session_save_credentials(email="you@email.com", password="...")
 | `cart_add` | Add item (requires confirmation) |
 | `cart_add_many` | Bulk add multiple items |
 | `cart_remove` | Remove item |
+
+### 📝 Shopping List Tools
+| Tool | Description |
+|------|-------------|
+| `shopping_list_check_auth` | Check authentication status |
+| `shopping_list_get` | View shopping list with all items and prices |
+| `shopping_list_add` | Add item (requires confirmation) |
+| `shopping_list_add_many` | Bulk add multiple items |
+| `shopping_list_remove` | Remove item by product ID |
 
 ### 🎟️ Coupon Tools
 | Tool | Description |
