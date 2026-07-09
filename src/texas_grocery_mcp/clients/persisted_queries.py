@@ -1,17 +1,27 @@
 """Persisted query hash discovery and auto-refresh.
 
 HEB uses Apollo Persisted Queries (APQ) with SHA-256 hashes that change
-when they deploy new frontend code. This module provides a mechanism to
-automatically discover the current hashes from HEB's JavaScript bundles
-when the hardcoded ones go stale.
+when they deploy new frontend code. This module keeps a seed→discovered→cache
+hierarchy so a stale seed can be overridden without cutting a release.
 
-The discovery flow:
-1. Fetch HEB homepage HTML to find JS bundle URLs
-2. Fetch each JS bundle and search for 64-char hex hashes near known
-   GraphQL operation names
-3. Cache discovered hashes to disk so they persist across restarts
+Two discovery paths, because HEB's current frontend defeats a pure-HTTP scan:
+
+1. ``auto_discover`` (HTTP, best-effort): fetch the homepage + JS bundles and
+   scan for hashes. Cheap and dependency-free, but on the current site it
+   often finds nothing — the operation hashes are not emitted as hex literals
+   near their operation names (document-id persisted queries), and the bundles
+   are served from ``cx.static.heb.com``. Kept as a zero-cost first attempt.
+2. ``discover_via_browser`` (reliable): attach over the DevTools Protocol to a
+   real Chrome the user is signed into, and read the ``sha256Hash`` values off
+   the live GraphQL traffic the site itself sends. This is the path that
+   actually captures rotating mutation hashes (e.g. ``cartItemV2``,
+   ``SelectPickupFulfillment``), which only fire on interaction. Driven by
+   ``scripts/refresh_persisted_hashes.py``.
+
+Both persist through the same on-disk cache, so a refresh survives restarts.
 """
 
+import contextlib
 import json
 import logging
 import re
@@ -31,6 +41,29 @@ _CACHE_TTL_SECONDS = 86400
 
 # Regex for 64-character lowercase hex SHA-256 hashes
 _HASH_RE = re.compile(r"([a-f0-9]{64})")
+
+
+def extract_persisted_hashes(post_data: str, known_ops: set[str]) -> dict[str, str]:
+    """Pull {operationName: sha256Hash} pairs from a GraphQL request body.
+
+    Handles both single and batched (JSON array) request bodies, keeping only
+    operations in ``known_ops``. Used to harvest hashes from live browser
+    traffic during ``PersistedQueryManager.discover_via_browser``.
+    """
+    out: dict[str, str] = {}
+    try:
+        parsed = json.loads(post_data)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return out
+    docs = parsed if isinstance(parsed, list) else [parsed]
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        op = doc.get("operationName")
+        sha = (doc.get("extensions") or {}).get("persistedQuery", {}).get("sha256Hash")
+        if op in known_ops and sha:
+            out.setdefault(op, sha)
+    return out
 
 
 class PersistedQueryManager:
@@ -218,6 +251,99 @@ class PersistedQueryManager:
             )
 
         return discovered
+
+    def discover_via_browser(
+        self,
+        cdp_url: str = "http://localhost:9222",
+        nudge_cart: bool = True,
+    ) -> dict[str, str]:
+        """Discover current hashes from a real Chrome's live GraphQL traffic.
+
+        Attaches over the Chrome DevTools Protocol to a browser the user
+        launched and signed into (``--remote-debugging-port``), and reads the
+        ``sha256Hash`` values off the requests the site itself makes. Unlike
+        the HTTP bundle scan, this reliably captures rotating hashes — including
+        mutation ops like ``cartItemV2`` that only fire on interaction — because
+        a genuine browser passes HEB's WAF where a launched automation browser
+        is hard-blocked.
+
+        Requires the ``[browser]`` extra (playwright). Read-only apart from an
+        optional net-zero cart quantity nudge (+1/-1) used to trigger
+        ``cartItemV2``. Discovered hashes are persisted to the cache.
+
+        Args:
+            cdp_url: DevTools endpoint of the user's Chrome.
+            nudge_cart: If True and ``cartItemV2`` hasn't fired, bump a cart
+                item's quantity +1/-1 to trigger it.
+
+        Returns:
+            Dict of {operation_name: hash} for the operations discovered.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:  # pragma: no cover - optional extra
+            logger.warning("playwright not installed; run: pip install '.[browser]'")
+            return {}
+
+        known_ops = set(self._seed_hashes.keys())
+        found: dict[str, str] = {}
+
+        def _harvest(req: Any) -> None:
+            try:
+                if "graphql" not in req.url.lower() or req.method != "POST" or not req.post_data:
+                    return
+                for op, sha in extract_persisted_hashes(req.post_data, known_ops).items():
+                    found.setdefault(op, sha)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+            if not browser.contexts:
+                logger.warning("No browser context at %s", cdp_url)
+                return {}
+            ctx = browser.contexts[0]
+            ctx.on("request", _harvest)
+            page = next((pg for pg in ctx.pages if "heb.com" in pg.url), None)
+            if page is None:
+                logger.warning("No heb.com tab found in the attached browser")
+                return {}
+
+            for url in ("https://www.heb.com/", "https://www.heb.com/cart"):
+                with contextlib.suppress(Exception):
+                    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                time.sleep(4)
+
+            if nudge_cart and "cartItemV2" not in found:
+                self._nudge_cart_quantity(page)
+
+        if found:
+            self._last_discovery = time.time()
+            self.update_hashes(found)  # persists hashes + last_discovery
+            logger.info("Browser discovery captured %d hashes", len(found))
+        return found
+
+    @staticmethod
+    def _nudge_cart_quantity(page: Any) -> None:
+        """Bump a cart item +1/-1 (net-zero) to fire the cartItemV2 mutation."""
+        inc = ['button[aria-label*="ncrement"]', 'button[aria-label*="ncrease"]',
+               'button[data-testid*="increment"]']
+        dec = ['button[aria-label*="ecrement"]', 'button[aria-label*="ecrease"]',
+               'button[data-testid*="decrement"]']
+
+        def _click(selectors: list[str]) -> bool:
+            for sel in selectors:
+                with contextlib.suppress(Exception):
+                    el = page.locator(sel).first
+                    if el.count() and el.is_visible():
+                        el.click(timeout=4000)
+                        return True
+            return False
+
+        if _click(inc):
+            time.sleep(4)
+            _click(dec)  # restore original quantity
+            time.sleep(3)
 
     def _scan_bundle(
         self,

@@ -10,8 +10,7 @@ Tests verify:
 
 import json
 import time
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -19,7 +18,6 @@ import respx
 from httpx import Response
 
 from texas_grocery_mcp.clients.persisted_queries import PersistedQueryManager
-
 
 # ─── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -174,7 +172,7 @@ def test_scan_bundle_finds_hash_near_operation_name(manager):
     manager._scan_bundle(js_content, set(SEED_HASHES.keys()), discovered)
 
     assert "cartEstimated" in discovered
-    assert discovered["cartEstimated"] == "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    assert discovered["cartEstimated"] == "abcdef0123456789" * 4
 
 
 def test_scan_bundle_finds_hash_in_reverse_order(manager):
@@ -366,3 +364,56 @@ async def test_discovery_failure_raises_clear_error():
         await client._execute_persisted_query(
             "cartEstimated", {"userIsLoggedIn": True}
         )
+
+
+# ─── Browser-traffic discovery (extract_persisted_hashes) ──────────────────────
+
+
+def test_extract_persisted_hashes_single():
+    """Extracts an operation→hash pair from a single GraphQL request body."""
+    from texas_grocery_mcp.clients.persisted_queries import extract_persisted_hashes
+
+    body = json.dumps(
+        {
+            "operationName": "cartItemV2",
+            "variables": {"quantity": 1},
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "d" * 64}},
+        }
+    )
+    out = extract_persisted_hashes(body, {"cartItemV2", "cartEstimated"})
+    assert out == {"cartItemV2": "d" * 64}
+
+
+def test_extract_persisted_hashes_batched_and_filtered():
+    """Handles batched bodies and ignores operations outside known_ops."""
+    from texas_grocery_mcp.clients.persisted_queries import extract_persisted_hashes
+
+    body = json.dumps(
+        [
+            {"operationName": "cartEstimated",
+             "extensions": {"persistedQuery": {"sha256Hash": "a" * 64}}},
+            {"operationName": "SomeUnknownOp",
+             "extensions": {"persistedQuery": {"sha256Hash": "b" * 64}}},
+        ]
+    )
+    out = extract_persisted_hashes(body, {"cartEstimated"})
+    assert out == {"cartEstimated": "a" * 64}
+
+
+def test_extract_persisted_hashes_ignores_malformed():
+    """Malformed bodies / missing hashes yield an empty dict, not an error."""
+    from texas_grocery_mcp.clients.persisted_queries import extract_persisted_hashes
+
+    assert extract_persisted_hashes("not json", {"cartEstimated"}) == {}
+    assert extract_persisted_hashes(json.dumps({"operationName": "cartEstimated"}),
+                                    {"cartEstimated"}) == {}
+
+
+def test_discover_via_browser_persists_when_playwright_missing(tmp_path):
+    """Without playwright the method degrades gracefully to an empty result."""
+    mgr = PersistedQueryManager(
+        seed_hashes={"cartEstimated": "a" * 64},
+        cache_path=tmp_path / "cache.json",
+    )
+    with patch.dict("sys.modules", {"playwright": None, "playwright.sync_api": None}):
+        assert mgr.discover_via_browser() == {}
