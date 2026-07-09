@@ -67,10 +67,16 @@ PERSISTED_QUERIES = {
     "cartEstimated": "0ef32acb778fc9d300ac62dc784b664323f105af9c4a6eacabaa72d1f1a73b55",
     "typeaheadContent": "1ed956c0f10efcfc375321f33c40964bc236fff1397a4e86b7b53cb3b18ad329",
     "cartItemV2": "d63a7fbddec89e5d7d9f36cc3f6ae40c719891e01b70169d7ada8aad11e5e0f0",
+    "getShoppingListsV2": "35da893a3476a098d44f8d6ac379db3129117b977d4df4dcbe48a5641eb9fdd5",
+    "getShoppingListV2": "4c8d819ca6029005863673c5d7962154955293fdde782786ce42f99ec3193b86",
+    "addToShoppingListV2": "a42ced362e226fc6913b7615da0a460a32c24af9cc7502c1f0fe52193855aa1b",
+    "deleteShoppingListItems": "b135b7899b1b6d1d7e176575b2dcb989d48fedda3050fe418618ec4a9690f6e3",
     "StoreSearch": "e01fa39e66c3a2c7881322bc48af6a5af97d49b1442d433f2d09d273de2db4b6",
     "CouponClip": "88b18ac22cee98372428d9a91d759ffb5e919026ee61c747f9f88d11336b846b",
     # Store change mutation - changes the active pickup store
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
+    "listPickupTimeslotsV2": "11e41cf668387eb09950234e6802eb6fe9c1bddb391ff3d83ae4ce47c1ceda08",
+    "ReserveTimeslot": "263b3cf61d086e3af9056f755fca18cb33f77808e876c7798ef032890b3afe19",
 }
 
 # Well-known HEB stores (fallback for store search)
@@ -159,6 +165,43 @@ class HEBGraphQLClient:
             ttl_hours=24,
             max_size=500,  # Cache up to 500 products
         )
+
+    def _build_persisted_query_payload(
+        self,
+        operation_name: str,
+        variables: dict[str, Any],
+        *,
+        batched: bool = False,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        # Hash comes from the manager (discovered/cache overrides stale seeds).
+        hash_value = self._pq_manager.get_hash(operation_name)
+        if not hash_value:
+            raise ValueError(f"No hash available for operation: {operation_name}")
+        payload: dict[str, Any] = {
+            "operationName": operation_name,
+            "variables": variables,
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": hash_value,
+                }
+            },
+        }
+        return [payload] if batched else payload
+
+    @staticmethod
+    def _extract_graphql_payload(data: Any) -> dict[str, Any]:
+        """Normalize GraphQL responses that may be wrapped in a single-item list."""
+        if isinstance(data, list):
+            if not data:
+                return {}
+            first_item = data[0]
+            if isinstance(first_item, dict):
+                return first_item
+            return {}
+        if isinstance(data, dict):
+            return data
+        return {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create basic HTTP client (no auth cookies)."""
@@ -264,6 +307,8 @@ class HEBGraphQLClient:
         self,
         operation_name: str,
         variables: dict[str, Any],
+        *,
+        batched: bool = False,
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query.
 
@@ -274,6 +319,7 @@ class HEBGraphQLClient:
         Args:
             operation_name: The name of the persisted operation
             variables: Query variables
+            batched: Send/parse the request as a single-item GraphQL batch
 
         Returns:
             Response data
@@ -290,31 +336,22 @@ class HEBGraphQLClient:
                 raise ValueError(f"Unknown operation: {operation_name}")
 
             client = await self._get_client()
-
-            hash_value = self._pq_manager.get_hash(operation_name)
-            if not hash_value:
-                raise ValueError(f"No hash available for operation: {operation_name}")
-
-            payload = {
-                "operationName": operation_name,
-                "variables": variables,
-                "extensions": {
-                    "persistedQuery": {
-                        "version": 1,
-                        "sha256Hash": hash_value,
-                    }
-                },
-            }
+            payload = self._build_persisted_query_payload(
+                operation_name,
+                variables,
+                batched=batched,
+            )
 
             try:
                 response = await client.post(self.base_url, json=payload)
                 response.raise_for_status()
 
                 data: Any = response.json()
+                graphql_payload = self._extract_graphql_payload(data)
 
                 # Check for persisted query errors
-                if "errors" in data:
-                    for error in data["errors"]:
+                if "errors" in graphql_payload:
+                    for error in graphql_payload["errors"]:
                         if "PersistedQueryNotFound" in str(error):
                             # Try auto-discovery and retry
                             retry_result = await self._handle_stale_hash(
@@ -327,14 +364,13 @@ class HEBGraphQLClient:
                                 f"and auto-discovery failed"
                             )
 
-                    raise GraphQLError(data["errors"])
+                    raise GraphQLError(graphql_payload["errors"])
 
                 self.circuit_breaker.record_success()
 
-                if isinstance(data, dict):
-                    payload_data = data.get("data")
-                    if isinstance(payload_data, dict):
-                        return cast(dict[str, Any], payload_data)
+                payload_data = graphql_payload.get("data")
+                if isinstance(payload_data, dict):
+                    return cast(dict[str, Any], payload_data)
                 return {}
 
             except (httpx.HTTPError, GraphQLError) as e:
@@ -1813,12 +1849,251 @@ class HEBGraphQLClient:
             {"userIsLoggedIn": True},
         )
 
+    async def list_pickup_timeslots(self, store_id: str | int) -> dict[str, Any]:
+        """List available pickup timeslots for a store."""
+        store_number = int(store_id)
+        data = await self._execute_persisted_query(
+            "listPickupTimeslotsV2",
+            {"storeNumber": store_number, "limit": 2147483647},
+            batched=True,
+        )
+        availability = data.get("listPickupTimeslotsV2", {})
+        slots_by_day = availability.get("slotsByDay", [])
+        display_messages = availability.get("displayMessages", [])
+
+        days: list[dict[str, Any]] = []
+        for day in slots_by_day:
+            groups: list[dict[str, Any]] = []
+            for group in day.get("slotsByGroup", []):
+                slots = [
+                    {
+                        "id": slot.get("id"),
+                        "record_id": slot.get("recordId"),
+                        "start": slot.get("start"),
+                        "end": slot.get("end"),
+                        "is_free": slot.get("isFree"),
+                        "days_in_advance": slot.get("daysInAdvance"),
+                        "fulfillment_type": slot.get("fulfillmentType"),
+                        "price": slot.get("totalPrice"),
+                        "fees": slot.get("fees", []),
+                    }
+                    for slot in group.get("slots", [])
+                ]
+                groups.append(
+                    {
+                        "group": group.get("group"),
+                        "title": group.get("title"),
+                        "tier": group.get("tier"),
+                        "empty_state_text": group.get("emptyStateText"),
+                        "price": group.get("price"),
+                        "slots": slots,
+                    }
+                )
+
+            days.append(
+                {
+                    "date": day.get("date"),
+                    "has_free": day.get("hasFree"),
+                    "is_full": day.get("isFull"),
+                    "min_price": day.get("minPrice"),
+                    "max_price": day.get("maxPrice"),
+                    "slot_count": sum(len(group["slots"]) for group in groups),
+                    "groups": groups,
+                }
+            )
+
+        return {
+            "store_id": str(store_id),
+            "available_days": len(days),
+            "days": days,
+            "display_messages": display_messages,
+        }
+
+    async def reserve_timeslot(
+        self,
+        slot_id: str,
+        date: str,
+        store_id: str | int,
+        ignore_conflicts: bool = False,
+    ) -> dict[str, Any]:
+        """Reserve a pickup timeslot and verify it via cart refresh."""
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Login required to reserve a pickup timeslot",
+            }
+
+        result = await self._execute_persisted_query_with_client(
+            auth_client,
+            "ReserveTimeslot",
+            {
+                "id": slot_id,
+                "date": date,
+                "fulfillmentType": "PICKUP",
+                "pickupStoreId": str(store_id),
+                "ignoreCartConflicts": ignore_conflicts,
+                "storeId": int(store_id),
+                "userIsLoggedIn": True,
+            },
+            batched=True,
+        )
+        reservation = result.get("reserveTimeslotV3", {})
+
+        cart = await self.get_cart()
+        if cart.get("error"):
+            return {
+                "error": True,
+                "code": "VERIFICATION_FAILED",
+                "message": "Timeslot reservation could not be verified - cart fetch failed",
+                "requested_slot_id": slot_id,
+                "reservation_response": reservation,
+            }
+
+        cart_v2 = cart.get("cartV2") or cart.get("cart") or {}
+        cart_slot = cart_v2.get("timeslot") or {}
+        actual_slot_id = str(cart_slot.get("id", ""))
+        actual_store_id = str(((cart_v2.get("fulfillment") or {}).get("store") or {}).get("id", ""))
+
+        if actual_slot_id == slot_id and actual_store_id == str(store_id):
+            return {
+                "success": True,
+                "verified": True,
+                "store_id": actual_store_id or str(store_id),
+                "timeslot": {
+                    "id": cart_slot.get("id"),
+                    "record_id": cart_slot.get("recordId"),
+                    "date": cart_slot.get("date"),
+                    "start_time": cart_slot.get("startTime"),
+                    "end_time": cart_slot.get("endTime"),
+                    "expiry": cart_slot.get("expiry"),
+                    "start_datetime": cart_slot.get("startDateTime"),
+                    "end_datetime": cart_slot.get("endDateTime"),
+                    "expiry_datetime": cart_slot.get("expiryDateTime"),
+                },
+                "reservation": reservation,
+            }
+
+        return {
+            "error": True,
+            "code": "TIMESLOT_NOT_RESERVED",
+            "message": (
+                "Timeslot reservation did not stick after verification. "
+                f"Cart shows slot '{actual_slot_id or 'none'}' "
+                f"for store '{actual_store_id or 'none'}'."
+            ),
+            "requested_slot_id": slot_id,
+            "actual_slot_id": actual_slot_id,
+            "requested_store_id": str(store_id),
+            "actual_store_id": actual_store_id,
+            "reservation_response": reservation,
+        }
+
+    async def get_shopping_lists(self) -> dict[str, Any]:
+        """Get all shopping lists for the authenticated user."""
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+        return await self._execute_persisted_query_with_client(
+            auth_client, "getShoppingListsV2", {}
+        )
+
+    async def get_shopping_list_items(
+        self,
+        list_id: str,
+    ) -> dict[str, Any]:
+        """Get the items of a specific shopping list, including their item UUIDs.
+
+        The item UUIDs are required by deleteShoppingListItems.
+
+        Args:
+            list_id: The list ID whose items to fetch
+
+        Returns:
+            List data (with items) or error dict if not authenticated
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+
+        return await self._execute_persisted_query_with_client(
+            auth_client,
+            "getShoppingListV2",
+            {
+                "input": {
+                    "id": list_id,
+                    "page": {"page": 0, "size": 500, "sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+        )
+
+    async def add_to_shopping_list(
+        self,
+        list_id: str,
+        product_id: str,
+        quantity: int = 1,
+    ) -> dict[str, Any]:
+        """Add an item to a shopping list.
+
+        Requires authentication cookies to be available.
+
+        Args:
+            list_id: The list ID
+            product_id: The product ID
+            quantity: Number of units to add (default 1)
+
+        Returns:
+            List response data or error dict if not authenticated
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+
+        return await self._execute_persisted_query_with_client(
+            auth_client,
+            "addToShoppingListV2",
+            {
+                "input": {
+                    "listId": list_id,
+                    "listItems": [
+                        {
+                            "item": {"productId": product_id},
+                            "quantityOrWeight": {"quantity": quantity},
+                        }
+                    ],
+                    "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+        )
+
+    async def delete_shopping_list_items(
+        self, list_id: str, item_ids: list[str]
+    ) -> dict[str, Any]:
+        """Delete items from a shopping list by their list-item UUIDs."""
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+        return await self._execute_persisted_query_with_client(
+            auth_client,
+            "deleteShoppingListItems",
+            {
+                "input": {
+                    "itemIds": item_ids,
+                    "listId": list_id,
+                    "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+        )
+
     @with_retry(config=RetryConfig(max_attempts=3, base_delay=1.0))
     async def _execute_persisted_query_with_client(
         self,
         client: httpx.AsyncClient,
         operation_name: str,
         variables: dict[str, Any],
+        *,
+        batched: bool = False,
     ) -> dict[str, Any]:
         """Execute a persisted GraphQL query with a specific client.
 
@@ -1830,6 +2105,7 @@ class HEBGraphQLClient:
             client: httpx client to use (may have cookies)
             operation_name: The name of the persisted operation
             variables: Query variables
+            batched: Send/parse the request as a single-item GraphQL batch
 
         Returns:
             Response data
@@ -1839,20 +2115,11 @@ class HEBGraphQLClient:
         if operation_name not in PERSISTED_QUERIES:
             raise ValueError(f"Unknown operation: {operation_name}")
 
-        hash_value = self._pq_manager.get_hash(operation_name)
-        if not hash_value:
-            raise ValueError(f"No hash available for operation: {operation_name}")
-
-        payload = {
-            "operationName": operation_name,
-            "variables": variables,
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": hash_value,
-                }
-            },
-        }
+        payload = self._build_persisted_query_payload(
+            operation_name,
+            variables,
+            batched=batched,
+        )
 
         try:
             response = await client.post(
@@ -1863,9 +2130,10 @@ class HEBGraphQLClient:
             response.raise_for_status()
 
             data: Any = response.json()
+            graphql_payload = self._extract_graphql_payload(data)
 
-            if "errors" in data:
-                for error in data["errors"]:
+            if "errors" in graphql_payload:
+                for error in graphql_payload["errors"]:
                     if "PersistedQueryNotFound" in str(error):
                         # Try auto-discovery and retry
                         retry_result = await self._handle_stale_hash(
@@ -1877,14 +2145,13 @@ class HEBGraphQLClient:
                             f"Persisted query hash for '{operation_name}' is no longer valid "
                             f"and auto-discovery failed"
                         )
-                raise GraphQLError(data["errors"])
+                raise GraphQLError(graphql_payload["errors"])
 
             self.circuit_breaker.record_success()
 
-            if isinstance(data, dict):
-                payload_data = data.get("data")
-                if isinstance(payload_data, dict):
-                    return cast(dict[str, Any], payload_data)
+            payload_data = graphql_payload.get("data")
+            if isinstance(payload_data, dict):
+                return cast(dict[str, Any], payload_data)
             return {}
 
         except (httpx.HTTPError, GraphQLError) as e:

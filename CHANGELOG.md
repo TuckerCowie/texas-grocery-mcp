@@ -8,13 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 Builds on the persisted-query auto-discovery work (#21) to make cart operations
-work against the current HEB frontend.
-
-### Fixed
-- Refresh the stale `cartEstimated`, `cartItemV2`, and `ShopNavigation` seed
-  hashes to current values, verified end-to-end (`cart_get` + `cart_add`
-  succeed against a live session). The previous seeds were rejected with
-  `PersistedQueryNotFound`.
+work against the current HEB frontend, and adds pickup + shopping-list tooling.
 
 ### Added
 - `PersistedQueryManager.discover_via_browser()` — captures current hashes
@@ -26,6 +20,20 @@ work against the current HEB frontend.
 - `scripts/refresh_persisted_hashes.py` — CLI wrapper that runs browser
   discovery and writes the results into the manager's on-disk cache.
 - `extract_persisted_hashes()` helper with unit tests.
+- **Pickup tools** (from craighdunn) — `pickup_times_get` lists available
+  curbside timeslots; `pickup_slot_reserve` reserves one (verified read path
+  against a live store).
+- **Shopping-list tools** (from #13, fsesma) — `shopping_list_check_auth`,
+  `shopping_list_get`, `shopping_list_add`, `shopping_list_add_many`,
+  `shopping_list_add_with_retry`, `shopping_list_remove`, plus the
+  `HEB_DEFAULT_SHOPPING_LIST` env var. `HEB_DEFAULT_STORE` is now applied at
+  server startup.
+
+### Fixed
+- Refresh the stale `cartEstimated`, `cartItemV2`, and `ShopNavigation` seed
+  hashes to current values, verified end-to-end (`cart_get` + `cart_add`
+  succeed against a live session). The previous seeds were rejected with
+  `PersistedQueryNotFound`.
 
 ## [0.1.2] - 2026-02-02
 

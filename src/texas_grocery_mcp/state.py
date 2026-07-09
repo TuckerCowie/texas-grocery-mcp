@@ -21,6 +21,7 @@ _request_store_id: ContextVar[str | None] = ContextVar("request_store_id", defau
 _state_lock = asyncio.Lock()
 _shared_state: dict[str, Any] = {
     "default_store_id": None,
+    "default_shopping_list_name": None,
     "found_stores": {},
     "graphql_client": None,
     "pending_login": None,
@@ -92,6 +93,18 @@ class StateManager:
         """Set store ID for the current request only."""
         _request_store_id.set(store_id)
 
+    # --- Default Shopping List Name ---
+
+    @staticmethod
+    def get_default_shopping_list_name() -> str | None:
+        """Get the current default shopping list name."""
+        return cast(str | None, _shared_state["default_shopping_list_name"])
+
+    @staticmethod
+    def set_default_shopping_list_name_sync(name: str | None) -> None:
+        """Set the default shopping list name."""
+        _shared_state["default_shopping_list_name"] = name
+
     # --- Found Stores Cache ---
 
     @staticmethod
@@ -151,6 +164,7 @@ class StateManager:
         """Reset all state. For testing only."""
         async with _state_lock:
             _shared_state["default_store_id"] = None
+            _shared_state["default_shopping_list_name"] = None
             _shared_state["found_stores"] = {}
             _shared_state["graphql_client"] = None
             _shared_state["pending_login"] = None

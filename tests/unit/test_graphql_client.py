@@ -183,6 +183,232 @@ async def test_get_categories_success(client):
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_execute_persisted_query_supports_batched_responses(client):
+    """Should unwrap single-item batched GraphQL responses."""
+    mock_response = [
+        {
+            "data": {
+                "listPickupTimeslotsV2": {
+                    "slotsByTier": [],
+                    "slotsByDay": [],
+                    "displayMessages": [],
+                }
+            }
+        }
+    ]
+
+    route = respx.post("https://www.heb.com/graphql").mock(
+        return_value=Response(200, json=mock_response)
+    )
+
+    data = await client._execute_persisted_query(
+        "listPickupTimeslotsV2",
+        {"storeNumber": 639, "limit": 2147483647},
+        batched=True,
+    )
+
+    assert data["listPickupTimeslotsV2"]["slotsByDay"] == []
+    assert route.calls.last.request.read() == (
+        b'[{"operationName":"listPickupTimeslotsV2","variables":{"storeNumber":639,'
+        b'"limit":2147483647},"extensions":{"persistedQuery":{"version":1,'
+        b'"sha256Hash":"11e41cf668387eb09950234e6802eb6fe9c1bddb391ff3d83ae4ce47c1ceda08"}}}]'
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_pickup_timeslots_parses_days_and_groups(client):
+    """Should parse pickup timeslot availability from batched GraphQL response."""
+    mock_response = [
+        {
+            "data": {
+                "listPickupTimeslotsV2": {
+                    "slotsByTier": [],
+                    "slotsByDay": [
+                        {
+                            "date": "2026-05-27",
+                            "hasFree": True,
+                            "isFull": False,
+                            "maxPrice": {"amount": 4.95, "formattedAmount": "$4.95"},
+                            "minPrice": {"amount": 0, "formattedAmount": "$0.00"},
+                            "slotsByGroup": [
+                                {
+                                    "group": "MORNING",
+                                    "title": "Morning",
+                                    "emptyStateText": None,
+                                    "tier": "SCHEDULED",
+                                    "price": {"amount": 0, "formattedAmount": "$0.00"},
+                                    "slots": [
+                                        {
+                                            "id": "slot-123",
+                                            "recordId": "slot-123",
+                                            "isFree": True,
+                                            "start": "2026-05-27T13:00:00Z",
+                                            "end": "2026-05-27T13:30:00Z",
+                                            "position": 1,
+                                            "daysInAdvance": 2,
+                                            "fees": [],
+                                            "fulfillmentType": "PICKUP",
+                                            "totalPrice": {"amount": 0, "formattedAmount": "$0.00"},
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                    "displayMessages": [],
+                }
+            }
+        }
+    ]
+
+    respx.post("https://www.heb.com/graphql").mock(
+        return_value=Response(200, json=mock_response)
+    )
+
+    result = await client.list_pickup_timeslots("639")
+
+    assert result["store_id"] == "639"
+    assert result["available_days"] == 1
+    assert result["days"][0]["date"] == "2026-05-27"
+    assert result["days"][0]["groups"][0]["slots"][0]["id"] == "slot-123"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_reserve_timeslot_verifies_cart_state():
+    """reserve_timeslot should verify the requested slot via a cart refresh."""
+    client = HEBGraphQLClient()
+
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    reserve_response = [
+        {
+            "data": {
+                "reserveTimeslotV3": {
+                    "timeslot": {
+                        "id": "slot-123",
+                        "recordId": "record-123",
+                        "date": "2026-05-27",
+                        "startTime": "2026-05-27T08:00:00-05:00",
+                        "endTime": "2026-05-27T08:30:00-05:00",
+                        "expiry": "2026-05-25T09:39:37-05:00",
+                    },
+                    "fulfillment": {
+                        "store": {"id": "639", "name": "Mueller H-E-B"}
+                    },
+                    "messages": [],
+                }
+            }
+        }
+    ]
+    cart_response = {
+        "data": {
+            "cartV2": {
+                "timeslot": {
+                    "id": "slot-123",
+                    "recordId": "record-123",
+                    "date": "2026-05-27",
+                    "startTime": "2026-05-27T08:00:00-05:00",
+                    "endTime": "2026-05-27T08:30:00-05:00",
+                    "expiry": "2026-05-25T09:39:37-05:00",
+                },
+                "fulfillment": {"store": {"id": "639"}},
+            }
+        }
+    }
+
+    with patch.object(client, "_get_authenticated_client") as mock_get_auth:
+        mock_auth_client = MagicMock()
+        call_count = [0]
+
+        def mock_post(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MagicMock(
+                    json=MagicMock(return_value=reserve_response),
+                    raise_for_status=MagicMock(),
+                )
+            return MagicMock(
+                json=MagicMock(return_value=cart_response),
+                raise_for_status=MagicMock(),
+            )
+
+        mock_auth_client.post = AsyncMock(side_effect=mock_post)
+        mock_get_auth.return_value = mock_auth_client
+
+        result = await client.reserve_timeslot(
+            slot_id="slot-123",
+            date="2026-05-27",
+            store_id="639",
+        )
+
+    assert result["success"] is True
+    assert result["verified"] is True
+    assert result["timeslot"]["id"] == "slot-123"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_reserve_timeslot_fails_when_verified_store_differs():
+    """reserve_timeslot should fail verification when the cart store differs."""
+    client = HEBGraphQLClient()
+
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    reserve_response = [
+        {
+            "data": {
+                "reserveTimeslotV3": {
+                    "timeslot": {"id": "slot-123", "recordId": "record-123", "date": "2026-05-27"},
+                    "fulfillment": {"store": {"id": "639", "name": "Mueller H-E-B"}},
+                    "messages": [],
+                }
+            }
+        }
+    ]
+    cart_response = {
+        "data": {
+            "cartV2": {
+                "timeslot": {"id": "slot-123", "recordId": "record-123", "date": "2026-05-27"},
+                "fulfillment": {"store": {"id": "641"}},
+            }
+        }
+    }
+
+    with patch.object(client, "_get_authenticated_client") as mock_get_auth:
+        mock_auth_client = MagicMock()
+        call_count = [0]
+
+        def mock_post(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return MagicMock(
+                    json=MagicMock(return_value=reserve_response),
+                    raise_for_status=MagicMock(),
+                )
+            return MagicMock(
+                json=MagicMock(return_value=cart_response),
+                raise_for_status=MagicMock(),
+            )
+
+        mock_auth_client.post = AsyncMock(side_effect=mock_post)
+        mock_get_auth.return_value = mock_auth_client
+
+        result = await client.reserve_timeslot(
+            slot_id="slot-123",
+            date="2026-05-27",
+            store_id="639",
+        )
+
+    assert result["error"] is True
+    assert result["code"] == "TIMESLOT_NOT_RESERVED"
+    assert result["requested_store_id"] == "639"
+    assert result["actual_store_id"] == "641"
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_handles_graphql_error(client):
     """Should raise on GraphQL errors in persisted queries."""
     mock_response = {
