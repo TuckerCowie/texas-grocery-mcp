@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Cart operations (`cart_get`, `cart_add`, `cart_add_many`) failed with
+  "Persisted query hash ... no longer valid" after HEB rotated its GraphQL
+  persisted-query hashes. Refreshed the stale `cartEstimated`, `cartItemV2`,
+  and `ShopNavigation` hashes to current values (verified end-to-end against a
+  live authenticated session).
+
+### Added
+- `scripts/refresh_persisted_hashes.py` — harvests HEB's current
+  persisted-query hashes from a logged-in Chrome (over the DevTools protocol)
+  so the constants can be regenerated the next time HEB rotates them, instead
+  of re-reverse-engineering by hand.
+
+### Changed
+- `PersistedQueryNotFoundError` now points to the refresh script so a future
+  rotation surfaces an actionable message.
+
 ## [0.1.2] - 2026-02-02
 
 ### Changed

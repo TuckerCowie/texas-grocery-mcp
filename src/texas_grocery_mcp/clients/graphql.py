@@ -55,14 +55,16 @@ class PersistedQueryNotFoundError(Exception):
     pass
 
 
-# Persisted Query Hashes (discovered via reverse engineering)
-# These may change when HEB deploys new code
+# Persisted Query Hashes (discovered via reverse engineering).
+# HEB rotates these when it deploys new frontend code; a stale hash yields a
+# PersistedQueryNotFoundError. Regenerate with scripts/refresh_persisted_hashes.py.
 PERSISTED_QUERIES = {
-    "ShopNavigation": "0e669423cef683226cb8eb295664619c8e0f95945734e0a458095f51ee89efb3",
+    # Cart + nav hashes last refreshed 2026-07-09 from live traffic.
+    "ShopNavigation": "53197129989f3555e560f3d11a85ebff9a2abe9d9cf6f7f10a8c93feda9503b2",
     "alertEntryPoint": "3e3ccd248652e8fce4674d0c5f3f30f2ddc63da277bfa0ff36ea9420e5dffd5e",
-    "cartEstimated": "7b033abaf2caa80bc49541e51d2b89e3cc6a316e37c4bd576d9b5c498a51e9c5",
+    "cartEstimated": "0ef32acb778fc9d300ac62dc784b664323f105af9c4a6eacabaa72d1f1a73b55",
     "typeaheadContent": "1ed956c0f10efcfc375321f33c40964bc236fff1397a4e86b7b53cb3b18ad329",
-    "cartItemV2": "ade8ec1365c185244d42f9cc4c13997fec4b633ac3c38ff39558df92b210c6d0",
+    "cartItemV2": "d63a7fbddec89e5d7d9f36cc3f6ae40c719891e01b70169d7ada8aad11e5e0f0",
     "StoreSearch": "e01fa39e66c3a2c7881322bc48af6a5af97d49b1442d433f2d09d273de2db4b6",
     "CouponClip": "88b18ac22cee98372428d9a91d759ffb5e919026ee61c747f9f88d11336b846b",
     # Store change mutation - changes the active pickup store
@@ -302,7 +304,9 @@ class HEBGraphQLClient:
                     for error in data["errors"]:
                         if "PersistedQueryNotFound" in str(error):
                             raise PersistedQueryNotFoundError(
-                                f"Persisted query hash for '{operation_name}' is no longer valid"
+                                f"Persisted query hash for '{operation_name}' is no longer "
+                                "valid. HEB rotated its GraphQL hashes on a deploy; refresh "
+                                "PERSISTED_QUERIES via scripts/refresh_persisted_hashes.py."
                             )
 
                     raise GraphQLError(data["errors"])
