@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Builds on the persisted-query auto-discovery work (#21) to make cart operations
+work against the current HEB frontend.
+
+### Fixed
+- Refresh the stale `cartEstimated`, `cartItemV2`, and `ShopNavigation` seed
+  hashes to current values, verified end-to-end (`cart_get` + `cart_add`
+  succeed against a live session). The previous seeds were rejected with
+  `PersistedQueryNotFound`.
+
+### Added
+- `PersistedQueryManager.discover_via_browser()` — captures current hashes
+  from the live GraphQL traffic of a real Chrome (attached over CDP), which
+  reliably recovers rotating mutation hashes (e.g. `cartItemV2`) that the HTTP
+  bundle scan cannot: on the current frontend the hashes aren't emitted as hex
+  literals near their operation names, so `auto_discover` finds nothing. Also
+  passes HEB's Imperva WAF, which hard-blocks a freshly launched browser.
+- `scripts/refresh_persisted_hashes.py` — CLI wrapper that runs browser
+  discovery and writes the results into the manager's on-disk cache.
+- `extract_persisted_hashes()` helper with unit tests.
+
 ## [0.1.2] - 2026-02-02
 
 ### Changed
