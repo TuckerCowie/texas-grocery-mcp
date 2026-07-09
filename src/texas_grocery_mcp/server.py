@@ -23,6 +23,7 @@ from texas_grocery_mcp.tools.coupon import (
     coupon_list,
     coupon_search,
 )
+from texas_grocery_mcp.tools.pickup import pickup_slot_reserve, pickup_times_get
 from texas_grocery_mcp.tools.product import product_get, product_search, product_search_batch
 from texas_grocery_mcp.tools.session import (
     session_clear,
@@ -117,11 +118,13 @@ This MCP requires an authenticated HEB.com session for most operations.
 - `store_search` - Find stores by address
 - `product_search` / `product_search_batch` - Search products (uses local store default)
 - `product_get` - Get detailed product info (ingredients, nutrition, warnings)
+- `pickup_times_get` - View pickup windows for a store/default store
 - `session_status` - Check session state
 - `session_refresh` - Refresh/login
 
 ### Tools that REQUIRE authentication:
 - `store_change` - Change store on HEB.com account
+- `pickup_slot_reserve` - Reserve a pickup window on HEB.com
 - `cart_get`, `cart_add`, `cart_add_many`, `cart_remove` - Cart operations
 - `coupon_list`, `coupon_clip`, `coupon_clipped` - Coupon operations
 
@@ -173,6 +176,10 @@ mcp.tool()(store_change)  # Changes store on HEB.com when authenticated, or sets
 mcp.tool(annotations={"readOnlyHint": True})(product_search)
 mcp.tool(annotations={"readOnlyHint": True})(product_search_batch)
 mcp.tool(annotations={"readOnlyHint": True})(product_get)
+
+# Register pickup tools
+mcp.tool(annotations={"readOnlyHint": True})(pickup_times_get)
+mcp.tool(annotations={"destructiveHint": True})(pickup_slot_reserve)
 
 # Register coupon tools
 mcp.tool(annotations={"readOnlyHint": True})(coupon_list)
