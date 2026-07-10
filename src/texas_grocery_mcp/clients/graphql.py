@@ -1922,7 +1922,28 @@ class HEBGraphQLClient:
         )
 
         try:
-            # Prefer authenticated client for discovery (bypasses WAF)
+            # 1) An out-of-band refresh (scripts/refresh_persisted_hashes.py or a
+            #    profile-copy harvest) may have written a fresh hash to the cache
+            #    file. As a process-lifetime singleton we won't see it unless we
+            #    re-read the file — try that first, it's cheaper than the HTTP scan
+            #    and is the common case when a human just refreshed the hashes.
+            old_hash = self._pq_manager.get_hash(operation_name)
+            if self._pq_manager.reload_if_changed():
+                reloaded = self._pq_manager.get_hash(operation_name)
+                if reloaded and reloaded != old_hash:
+                    logger.info(
+                        "Reloaded persisted-query cache from disk; retrying '%s' with %s...",
+                        operation_name,
+                        reloaded[:16],
+                    )
+                    data = await self._retry_with_hash(
+                        client, operation_name, variables, reloaded
+                    )
+                    if data is not None:
+                        return data
+
+            # 2) Fall back to the HTTP bundle scan (prefer the authenticated
+            #    client so it can pass the WAF).
             discover_client = await self._get_authenticated_client()
             if not discover_client:
                 discover_client = client
@@ -1946,8 +1967,27 @@ class HEBGraphQLClient:
                 operation_name,
                 new_hash[:16],
             )
+            return await self._retry_with_hash(
+                client, operation_name, variables, new_hash
+            )
 
-            # Retry with the fresh hash
+        except Exception as e:
+            logger.error(
+                "Auto-discovery retry failed for '%s': %s",
+                operation_name,
+                str(e),
+            )
+            return None
+
+    async def _retry_with_hash(
+        self,
+        client: httpx.AsyncClient,
+        operation_name: str,
+        variables: dict[str, Any],
+        new_hash: str,
+    ) -> dict[str, Any] | None:
+        """Re-issue a persisted query with a specific hash. Returns data or None."""
+        try:
             retry_payload = {
                 "operationName": operation_name,
                 "variables": variables,
@@ -1958,7 +1998,6 @@ class HEBGraphQLClient:
                     }
                 },
             }
-
             response = await client.post(
                 self.base_url,
                 json=retry_payload,
@@ -1970,7 +2009,6 @@ class HEBGraphQLClient:
             response.raise_for_status()
 
             retry_data: Any = response.json()
-
             if "errors" in retry_data:
                 logger.error(
                     "Retry still failed for '%s': %s",
@@ -1980,7 +2018,6 @@ class HEBGraphQLClient:
                 return None
 
             self.circuit_breaker.record_success()
-
             if isinstance(retry_data, dict):
                 payload_data = retry_data.get("data")
                 if isinstance(payload_data, dict):
@@ -1989,9 +2026,7 @@ class HEBGraphQLClient:
 
         except Exception as e:
             logger.error(
-                "Auto-discovery retry failed for '%s': %s",
-                operation_name,
-                str(e),
+                "Persisted-query retry failed for '%s': %s", operation_name, str(e)
             )
             return None
 

@@ -150,6 +150,33 @@ def test_cache_corrupt_file_is_handled(cache_file):
     assert mgr.get_hash("cartEstimated") == SEED_HASHES["cartEstimated"]
 
 
+def test_reload_if_changed_picks_up_out_of_band_write(manager, cache_file):
+    """A hash refreshed on disk after init is picked up without a restart."""
+    # Nothing on disk yet, so the manager is serving the seed hash.
+    assert manager.get_hash("cartEstimated") == SEED_HASHES["cartEstimated"]
+
+    # Simulate scripts/refresh_persisted_hashes.py writing a fresh hash.
+    fresh = "f" * 64
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps({"hashes": {"cartEstimated": fresh},
+                                      "last_discovery": time.time()}))
+
+    assert manager.reload_if_changed() is True
+    assert manager.get_hash("cartEstimated") == fresh
+
+
+def test_reload_if_changed_noop_when_unchanged(manager, cache_file):
+    """reload_if_changed returns False when the file mtime hasn't advanced."""
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    manager.update_hash("cartEstimated", "9" * 64)  # writes + records mtime
+    assert manager.reload_if_changed() is False
+
+
+def test_reload_if_changed_false_when_no_file(manager):
+    """reload_if_changed is a safe no-op when the cache file doesn't exist."""
+    assert manager.reload_if_changed() is False
+
+
 # ─── JS Bundle Scanning Tests ──────────────────────────────────────────────────
 
 
@@ -335,6 +362,50 @@ async def test_stale_hash_triggers_discovery_and_retry():
 
     # Manager should now have the fresh hash cached
     assert client._pq_manager.get_hash("cartEstimated") == fresh_hash
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_stale_hash_reloads_cache_and_retries(tmp_path):
+    """An out-of-band cache refresh is picked up on the recovery path — no restart,
+    and without relying on HTTP auto-discovery."""
+    from unittest.mock import patch as mock_patch
+
+    from texas_grocery_mcp.clients.graphql import HEBGraphQLClient
+
+    client = HEBGraphQLClient()
+    mgr = client._pq_manager
+    cache_path = tmp_path / "pq_cache.json"
+    mgr._cache_path = cache_path
+    mgr._cache_mtime = 0.0
+    mgr._discovered = {"cartEstimated": "a" * 64}  # stale in-memory hash
+
+    fresh_hash = "b" * 64
+    # Simulate scripts/refresh_persisted_hashes.py writing a fresh hash to disk.
+    cache_path.write_text(json.dumps(
+        {"hashes": {"cartEstimated": fresh_hash}, "last_discovery": time.time()}
+    ))
+
+    call_count = [0]
+
+    def graphql_responder(request):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return Response(200, json={"errors": [{"message": "PersistedQueryNotFound"}]})
+        return Response(200, json={"data": {"cartEstimated": {"items": []}}})
+
+    respx.post(host="www.heb.com", path="/graphql").mock(side_effect=graphql_responder)
+
+    # Force HTTP discovery to find nothing, proving the reload is what recovered.
+    async def empty_discover(_client, **kw):
+        return {}
+
+    with mock_patch.object(mgr, "auto_discover", side_effect=empty_discover):
+        result = await client._execute_persisted_query("cartEstimated", {})
+
+    assert "cartEstimated" in result
+    assert call_count[0] >= 2  # initial + retry with reloaded hash
+    assert mgr.get_hash("cartEstimated") == fresh_hash
 
 
 @pytest.mark.asyncio
