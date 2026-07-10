@@ -91,6 +91,7 @@ class PersistedQueryManager:
         self._cache_path = cache_path or _DEFAULT_CACHE_PATH
         self._discovered: dict[str, str] = {}
         self._last_discovery: float = 0.0
+        self._cache_mtime: float = 0.0
         self._load_cache()
 
     def get_hash(self, operation_name: str) -> str | None:
@@ -164,6 +165,24 @@ class PersistedQueryManager:
         if not self._discovered:
             return False
         return (time.time() - self._last_discovery) < max_age_seconds
+
+    def reload_if_changed(self) -> bool:
+        """Re-read the on-disk cache if the file changed since the last load.
+
+        The GraphQL client is a process-lifetime singleton, so a hash refresh
+        performed out-of-band (``scripts/refresh_persisted_hashes.py`` or a
+        profile-copy harvest) is otherwise invisible until the server restarts.
+        Calling this on the stale-hash recovery path lets a running server pick
+        up a freshly-written hash with no restart. Returns True if reloaded.
+        """
+        try:
+            mtime = self._cache_path.stat().st_mtime
+        except OSError:
+            return False
+        if mtime <= self._cache_mtime:
+            return False
+        self._load_cache()
+        return True
 
     async def auto_discover(
         self,
@@ -403,6 +422,8 @@ class PersistedQueryManager:
                 data = json.loads(self._cache_path.read_text())
                 self._discovered = data.get("hashes", {})
                 self._last_discovery = data.get("last_discovery", 0.0)
+                with contextlib.suppress(OSError):
+                    self._cache_mtime = self._cache_path.stat().st_mtime
                 logger.info(
                     "Loaded %d cached persisted query hashes",
                     len(self._discovered),
@@ -423,5 +444,9 @@ class PersistedQueryManager:
                     indent=2,
                 )
             )
+            # Record our own write's mtime so reload_if_changed() doesn't treat
+            # it as an external change and needlessly reload.
+            with contextlib.suppress(OSError):
+                self._cache_mtime = self._cache_path.stat().st_mtime
         except OSError as e:
             logger.warning("Failed to save hash cache: %s", e)
